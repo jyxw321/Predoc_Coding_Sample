@@ -1,0 +1,856 @@
+---
+Title: DataSci 451 Final Project, WN 2025
+Author: Joy Wang
+---
+# Note: Raw Dota 2 match data is not included in this repo.
+# This document illustrates my modeling and data-wrangling code.
+
+# 1. Packages
+```{r}
+rm(list = ls())
+library(ggplot2)
+library(tidyverse)
+library(rstan)
+library(coda)
+library(rstanarm)
+library(reshape2)
+```
+```{r}
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+options(buildtools.check = function(action) TRUE )
+```
+
+# 2. Import & Pre-Select Data
+```{r}
+players = read.csv("players.csv")
+players_cleaned = players %>% filter(account_id != 0)
+rm(players)
+
+match = read.csv("match.csv")
+match = match %>% filter(game_mode == 2)
+
+player_rating = read.csv("player_ratings.csv")
+
+teamfights = read.csv("teamfights_players.csv")
+teamfights_agg = teamfights %>%
+  group_by(match_id, player_slot) %>%
+  summarise(
+    teamfight_damage = sum(damage, na.rm = TRUE),
+    teamfight_xp_end = sum(xp_end, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+any(is.na(match$radiant_win)) #  checking
+```
+
+# 3. Pre Analysis
+## 3.1 Distribution of Player Win Rates Based on Matching System
+```{r}
+player_win_new = players_cleaned %>% select(match_id, account_id, player_slot) %>% 
+  left_join(match %>% select(match_id, radiant_win)) %>% 
+  drop_na() %>%
+  mutate(radiant_win = as.logical(radiant_win),
+         radiant = intToBits(player_slot)[1:8][1] == 0,
+         win = radiant == radiant_win) %>%
+  group_by(account_id) %>% 
+  mutate(num_win = sum(win), num_game = n(), win_prob = mean(win)) %>% 
+  filter(num_game >= 3, num_game <= 10)
+
+player_win_experienced = players_cleaned %>% select(match_id, account_id, player_slot) %>% 
+  left_join(match %>% select(match_id, radiant_win)) %>% 
+  drop_na() %>%
+  mutate(radiant_win = as.logical(radiant_win),
+         radiant = intToBits(player_slot)[1:8][1] == 0,
+         win = radiant == radiant_win) %>%
+  group_by(account_id) %>% 
+  mutate(num_win = sum(win), num_game = n(), win_prob = mean(win)) %>% 
+  filter(num_game > 10)
+
+
+head(player_win_new)
+cat("sample size:", nrow(player_win_new))
+cat("sample size:", nrow(player_win_experienced))
+```
+
+```{r}
+inexp_pre = player_win_new %>% 
+  ggplot(aes(x = win_prob)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  geom_vline(
+    aes(xintercept = mean(win_prob)), 
+    color = "darkblue", 
+    linetype = "dashed", 
+    linewidth = 0.5,
+    label = "mean"
+  ) +
+  labs(
+    title = "Distribution of Player Win Rates Based on Matching System",
+    subtitle = "played 3-10 games",
+    x = "Win Rate",
+    y = "Density"
+  ) +
+  theme_minimal()
+inexp_pre
+```
+
+```{r}
+exp_pre = player_win_experienced %>% 
+  ggplot(aes(x = win_prob)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  geom_vline(
+    aes(xintercept = mean(win_prob)), 
+    color = "darkblue", 
+    linetype = "dashed", 
+    linewidth = 0.5
+  ) +
+  labs(
+    title = "Distribution of Player Win Rates Based on Matching System",
+    subtitle = "played > 10 games",
+    x = "Win Rate",
+    y = "Density"
+  ) +
+  theme_minimal()
+exp_pre
+```
+
+## 3.2 Correlation Analysis
+```{r}
+cor_df = players_cleaned %>% 
+  left_join(match %>% select(match_id, radiant_win, duration)) %>% 
+  mutate(radiant_win = as.logical(radiant_win),
+         radiant = intToBits(player_slot)[1:8][1] == 0,
+         win = radiant == radiant_win, 
+         n = n()) %>% 
+  filter(n >= 10) %>%
+  left_join(player_rating %>% select(account_id)) %>%
+  left_join(teamfights_agg, by = c("match_id", "player_slot")) %>%
+  mutate(
+    teamfight_damage = ifelse(is.na(teamfight_damage), 0, teamfight_damage),
+    teamfight_xp_end = ifelse(is.na(teamfight_xp_end), 0, teamfight_xp_end)
+  ) %>%
+  select(-match_id, -player_slot, -gold_spent, -gold_sell, -item_0, -item_1, -item_2, -item_3, -item_4, -item_5, -level)  %>%
+  group_by(account_id) %>% mutate(win_prob = mean(win)) %>%
+  ungroup() %>% 
+  select(-win_prob, -stuns, -gold_other, -gold_abandon, -gold_killing_roshan, -radiant_win, -starts_with("unit"), -radiant, -starts_with("gold_"), -leaver_status, -denies, -last_hits, -xp_creep) %>%
+  select(-account_id, -n) %>%
+  drop_na()
+
+zero_variance_columns = sapply(cor_df, function(x) sd(x) == 0)
+print(names(cor_df)[zero_variance_columns]) # checking
+
+correlation_matrix = cor(cor_df, use = "complete.obs") 
+```
+
+```{r}
+correlation_data = melt(correlation_matrix)
+
+ggplot(correlation_data, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap of Player and Team Metrics", 
+       x = "Variables", y = "Variables", fill = "Correlation")
+```
+
+# 4. Beta Binomial model
+## 4.1 Model
+```{r}
+binomial_code = "
+  data{
+    int<lower=0> N;
+    int<lower=0> y[N];
+    int<lower=0> n[N];
+  }
+  parameters{
+    real<lower=0, upper=1> omega;
+    real<lower=0> kappa; # denote as kappe - 2
+    vector<lower=0, upper=1>[N] theta;
+  }
+  model{
+    omega ~ beta(1,1);
+    kappa ~ gamma(0.1,0.1);
+    for(i in 1:N){
+      theta[i] ~ beta(omega*kappa+1, (1-omega)*kappa+1);
+      y[i] ~ binomial(n[i], theta[i]);
+    }
+  }
+"
+```
+```{r}
+data_new = list(
+  N = nrow(player_win_new),
+  y = player_win_new$num_win,
+  n = player_win_new$num_game
+            )
+
+fit = stan(model_code = binomial_code, data = data_new, iter = 10000, chains = 2, warmup = 1000, seed = 451)
+
+data_exp = list(
+  N = nrow(player_win_experienced),
+  y = player_win_experienced$num_win,
+  n = player_win_experienced$num_game
+            )
+
+fit2 = stan(model_code = binomial_code, data = data_exp, iter = 10000, chains = 2, warmup = 1000, seed = 451)
+```
+
+## 4.2 Plots & Results
+```{r}
+# trace plot
+rstan::traceplot(fit, pars = c("omega", "kappa"))
+rstan::traceplot(fit2, pars = c("omega", "kappa"))
+
+# autocorrelation
+stan_scat(fit, pars = c("omega", "kappa"), col = "steelblue")
+stan_scat(fit2, pars = c("omega", "kappa"), col = "steelblue")
+
+# effective sample size
+summary_fit = summary(fit, pars = c("omega", "kappa"))
+ess_omega = summary_fit$summary["omega", "n_eff"]
+ess_kappa = summary_fit$summary["kappa", "n_eff"]
+
+summary_fit2 = summary(fit2, pars = c("omega", "kappa"))
+ess_omega2 = summary_fit2$summary["omega", "n_eff"]
+ess_kappa2 = summary_fit2$summary["kappa", "n_eff"]
+```
+
+```{r}
+omega_samples = rstan::extract(fit)$omega
+kappa_samples = rstan::extract(fit)$kappa
+omega_samples2 = rstan::extract(fit2)$omega
+kappa_samples2 = rstan::extract(fit2)$kappa
+
+posterior_prob = (omega_samples * kappa_samples+1) / (kappa_samples + 2)
+posterior_prob2 = (omega_samples2 * kappa_samples2+1) / (kappa_samples2 + 2)
+
+# histogram
+set.seed(123)
+n_prior = 10000
+omega_prior = rbeta(n_prior, 1, 1)
+kappa_prior = rgamma(n_prior, 2.1, 2.1)
+prior_prob = (omega_prior * kappa_prior + 1) / (kappa_prior + 2)
+
+inexp_df = tibble(
+  value = c(prior_prob, posterior_prob),
+  distribution = rep(c("Prior", "Posterior"), c(length(prior_prob), length(posterior_prob)))
+)
+
+posterior_mean <- mean(posterior_prob)
+posterior_ci <- quantile(posterior_prob, c(0.025, 0.975))
+print(posterior_mean)
+print(posterior_ci)
+
+ggplot(inexp_df, aes(x = value, fill = distribution)) +
+  geom_density(alpha = 0.4, color = NA) +
+  scale_fill_manual(values = c("Prior" = "skyblue", "Posterior" = "darkorange")) +
+  geom_vline(xintercept = posterior_mean, color = "darkorange", linetype = "dashed", linewidth = 0.5) +
+  labs(
+    title = expression("Prior and Posterior Distributions of " * E(theta[{"i|1"}])),
+    x = "Probability", 
+    y = "Density"
+  ) +
+  xlim(0.1, 0.8) +
+  theme_minimal(base_size = 14)
+
+exp_df = tibble(
+  value = c(prior_prob, posterior_prob2),
+  distribution = rep(c("Prior", "Posterior"), c(length(prior_prob), length(posterior_prob2)))
+)
+
+posterior_mean2 <- mean(posterior_prob2)
+posterior_ci2 <- quantile(posterior_prob2, c(0.025, 0.975))
+print(posterior_mean2)
+print(posterior_ci2)
+
+ggplot(exp_df, aes(x = value, fill = distribution)) +
+  geom_density(alpha = 0.4, color = NA) +
+  scale_fill_manual(values = c("Prior" = "skyblue", "Posterior" = "darkorange")) +
+  geom_vline(xintercept = posterior_mean2, color = "darkorange", linetype = "dashed", linewidth = 0.5) +
+  labs(
+    title = expression("Prior and Posterior Distributions of " * E(theta[{"i|2"}])),
+    x = "Probability", 
+    y = "Density"
+  ) +
+  xlim(0.1,0.8) +
+  theme_minimal(base_size = 14)
+```
+
+## 4.3 Prior Sensitivity Analysis
+```{r}
+binomial_code2 = "
+  data{
+    int<lower=0> N;
+    int<lower=0> y[N];
+    int<lower=0> n[N];
+  }
+  parameters{
+    real<lower=0, upper=1> omega;
+    real<lower=0> kappa; # denote as kappe - 2
+    vector<lower=0, upper=1>[N] theta;
+  }
+  model{
+    omega ~ beta(3,1);
+    kappa ~ gamma(0.1,1.1);
+    for(i in 1:N){
+      theta[i] ~ beta(omega*kappa+1, (1-omega)*kappa+1);
+      y[i] ~ binomial(n[i], theta[i]);
+    }
+  }
+"
+```
+```{r}
+fit_prior_sen = stan(model_code = binomial_code, data = data_new, iter = 10000, chains = 2, warmup = 1000, seed = 451)
+
+fit2_prior_sen = stan(model_code = binomial_code, data = data_exp, iter = 10000, chains = 2, warmup = 1000, seed = 451)
+```
+```{r}
+omega_samples = rstan::extract(fit_prior_sen)$omega
+kappa_samples = rstan::extract(fit_prior_sen)$kappa
+omega_samples2 = rstan::extract(fit2_prior_sen)$omega
+kappa_samples2 = rstan::extract(fit2_prior_sen)$kappa
+
+posterior_prob = (omega_samples * kappa_samples+1) / (kappa_samples + 2)
+posterior_prob2 = (omega_samples2 * kappa_samples2+1) / (kappa_samples2 + 2)
+
+# histogram
+set.seed(123)
+n_prior = 10000
+omega_prior = rbeta(n_prior, 1, 1)
+kappa_prior = rgamma(n_prior, 2.1, 2.1)
+prior_prob = (omega_prior * kappa_prior + 1) / (kappa_prior + 2)
+
+inexp_df = tibble(
+  value = c(prior_prob, posterior_prob),
+  distribution = rep(c("Prior", "Posterior"), c(length(prior_prob), length(posterior_prob)))
+)
+
+posterior_mean <- mean(posterior_prob)
+posterior_ci <- quantile(posterior_prob, c(0.025, 0.975))
+print(posterior_mean)
+print(posterior_ci)
+
+ggplot(inexp_df, aes(x = value, fill = distribution)) +
+  geom_density(alpha = 0.4, color = NA) +
+  scale_fill_manual(values = c("Prior" = "skyblue", "Posterior" = "darkorange")) +
+  geom_vline(xintercept = posterior_mean, color = "darkorange", linetype = "dashed", linewidth = 0.5) +
+  labs(
+    title = expression("Prior and Posterior Distributions of " * E(theta[{"i|1"}])),
+    x = "Probability", 
+    y = "Density"
+  ) +
+  xlim(0.1, 0.8) +
+  theme_minimal(base_size = 14)
+
+exp_df = tibble(
+  value = c(prior_prob, posterior_prob2),
+  distribution = rep(c("Prior", "Posterior"), c(length(prior_prob), length(posterior_prob2)))
+)
+
+posterior_mean2 <- mean(posterior_prob2)
+posterior_ci2 <- quantile(posterior_prob2, c(0.025, 0.975))
+print(posterior_mean2)
+print(posterior_ci2)
+
+ggplot(exp_df, aes(x = value, fill = distribution)) +
+  geom_density(alpha = 0.4, color = NA) +
+  scale_fill_manual(values = c("Prior" = "skyblue", "Posterior" = "darkorange")) +
+  geom_vline(xintercept = posterior_mean2, color = "darkorange", linetype = "dashed", linewidth = 0.5) +
+  labs(
+    title = expression("Prior and Posterior Distributions of " * E(theta[{"i|2"}])),
+    x = "Probability", 
+    y = "Density"
+  ) +
+  xlim(0.1,0.8) +
+  theme_minimal(base_size = 14)
+```
+
+
+# 5. Logistic Model
+## 5.1 Individual Player Level
+### 5.1.1 Data Merging
+```{r}
+player_df = players_cleaned %>% select(match_id, account_id, player_slot, kills, deaths, assists, gold, tower_damage, hero_damage, hero_healing) %>% 
+  left_join(match %>% select(match_id, radiant_win, duration)) %>% 
+  mutate(radiant_win = as.logical(radiant_win),
+         radiant = intToBits(player_slot)[1:8][1] == 0,
+         win = radiant == radiant_win) %>%
+  left_join(teamfights_agg, by = c("match_id", "player_slot")) %>%
+  mutate(
+    teamfight_damage = ifelse(is.na(teamfight_damage), 0, teamfight_damage),
+    teamfight_xp_end = ifelse(is.na(teamfight_xp_end), 0, teamfight_xp_end)
+  ) %>%
+  group_by(account_id) %>% 
+  mutate(num_win = sum(win), num_game = n()) %>%
+  ungroup() %>%
+  drop_na()
+```
+
+### 5.1.2 Model
+```{r}
+idd_stan = "
+data {
+  int<lower=0> N;                      // 
+  array[N] int<lower=0,upper=1> y;     // win or not
+  vector[N] x1;                        // kills
+  vector[N] x2;                        // deaths
+  vector[N] x3;                        // assists
+  vector[N] x4;                        // gold
+  vector[N] x5;                        // teamfight_damage
+  vector[N] x6;                        // teamfight_xp_end
+  vector[N] x7;                        // duration
+}
+parameters {
+  real theta0;                         // intercept
+  real theta1;                         // kills
+  real theta2;                         // deaths
+  real theta3;                         // assists
+  real theta4;                         // gold
+  real theta5;                         // teamfight_damage
+  real theta6;                         // teamfight_xp_end
+  real theta7;                         // duration
+}
+model {
+  y ~ bernoulli_logit(theta0 + theta1*x1 + theta2*x2 + theta3*x3 + 
+                     theta4*x4 + theta5*x5 + theta6*x6 + theta7*x7);
+}
+"
+```
+```{r}
+# Standardization
+player_df$kills_z <- as.vector(scale(player_df$kills))
+player_df$deaths_z <- as.vector(scale(player_df$deaths))
+player_df$assists_z <- as.vector(scale(player_df$assists))
+player_df$gold_z <- as.vector(scale(player_df$gold))
+player_df$damage_z <- as.vector(scale(player_df$teamfight_damage))
+player_df$xp_z <- as.vector(scale(player_df$teamfight_xp_end))
+player_df$duration_z <- as.vector(scale(player_df$duration))
+
+data_player = list(
+  N = nrow(player_df),
+  y = player_df$win,
+  x1 = player_df$kills_z,          
+  x2 = player_df$deaths_z,        
+  x3 = player_df$assists_z,      
+  x4 = player_df$gold_z,          
+  x5 = player_df$damage_z,        
+  x6 = player_df$xp_z,             
+  x7 = player_df$duration_z       
+)
+
+model_idd = stan_model(model_code = idd_stan)
+fit3 = sampling(
+  object = model_idd,
+  data = data_player,
+  chains = 2,
+  warmup = 1000,
+  iter = 10^4,
+  seed = 451
+)
+```
+
+### 5.1.3 Plots & Results
+```{r}
+print(fit3)
+stan_trace(fit3, nrow = 5)
+stan_hist(fit3)
+```
+```{r}
+mcmc_samples <- As.mcmc.list(fit3)
+
+param_names <- c("theta0", "theta_kills", "theta_deaths", "theta_assists", 
+                  "theta_gold", "theta_tfdamage", "theta_tfxp", "theta_duration")
+# Autocorrelation
+ acfplot(mcmc_samples[, param_names])
+
+
+mcmc_samples <- As.mcmc.list(fit3)
+
+# ESS
+ess_vals <- effectiveSize(mcmc_samples)
+
+param_names <- c("theta0", "theta_kills", "theta_deaths", "theta_assists", 
+                  "theta_gold", "theta_tfdamage", "theta_tfxp", "theta_duration")
+
+ess_df <- data.frame(
+  parameter = param_names,
+  ess = ess_vals[param_names]
+)
+
+#histogram
+ggplot(ess_df, aes(x = parameter, y = ess)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Effective Sample Size per Parameter",
+    x = "Parameter", y = "Effective Sample Size"
+  ) +
+  geom_text(aes(label = round(ess, 1)), vjust = -0.5)
+```
+```{r}
+plot(fit3,
+     pars = c("theta0", 
+              "theta_kills", "theta_deaths", "theta_assists", 
+              "theta_gold", "theta_tfdamage", "theta_tfxp", 
+              "theta_duration"),
+     point_est = "median",     
+     outer_level = 0.95,       
+     show_density = FALSE)    
+```
+
+
+### 5.1.4 Prior Sensitivty Analysis
+```{r}
+idd_stan_prior = "
+data {
+  int<lower=0> N;                      
+  array[N] int<lower=0,upper=1> y;     
+  vector[N] x1;                        
+  vector[N] x2;                        
+  vector[N] x3;                        
+  vector[N] x4;                        
+  vector[N] x5;                        
+  vector[N] x6;                        
+  vector[N] x7;                        
+}
+parameters {
+  real theta0;                         
+  real theta1;                         
+  real theta2;                         
+  real theta3;                         
+  real theta4;                         
+  real theta5;                         
+  real theta6;                         
+  real theta7;                         
+}
+model {
+  theta0 ~ normal(0, 1);
+  theta1 ~ normal(0, 1);
+  theta2 ~ normal(0, 1);
+  theta3 ~ normal(0, 1);
+  theta4 ~ normal(0, 1);
+  theta5 ~ normal(0, 1);
+  theta6 ~ normal(0, 1);
+  theta7 ~ normal(0, );
+
+  y ~ bernoulli_logit(theta0 + theta1*x1 + theta2*x2 + theta3*x3 + 
+                     theta4*x4 + theta5*x5 + theta6*x6 + theta7*x7);
+}
+"
+```
+```{r}
+model_idd_prior = stan_model(model_code = idd_stan_prior)
+fit3_prior = sampling(
+  object = model_idd_prior,
+  data = data_player,
+  chains = 2,
+  warmup = 1000,
+  iter = 10000,
+  seed = 123
+)
+```
+```{r}
+# Compare posterior estimates
+print(fit3, pars = c("theta0", "theta1", "theta2", "theta3", "theta4", "theta5", "theta6", "theta7"), probs = c(0.025, 0.975))
+print(fit3_prior, pars = c("theta0", "theta1", "theta2", "theta3", "theta4", "theta5", "theta6", "theta7"), probs = c(0.025, 0.975))
+```
+```{r}
+theta_names <- c("θ intercept", "θ assists", "θ deaths", "θ duration",
+                 "θ gold", "θ kills", "θ team fight damage", "θ team fight xp")
+
+uninfor_prior <- data.frame(
+  theta = theta_names,
+  mean = c(-0.04, -0.05, 0.00, -0.01, 0.12, 0.04, 0.04, 0.03),
+  lower = c(-0.10, -0.14, -0.06, -0.07, 0.05, -0.05, -0.08, -0.06),
+  upper = c(0.02, 0.04, 0.07, 0.06, 0.18, 0.13, 0.16, 0.12),
+  source = "Uninformative prior"
+)
+
+moderate_prior <- data.frame(
+  theta = theta_names,
+  mean = c(-0.04, -0.05, 0.00, -0.01, 0.12, 0.04, 0.04, 0.03),
+  lower = c(-0.10, -0.14, -0.06, -0.07, 0.05, -0.04, -0.08, -0.06),
+  upper = c(0.02, 0.04, 0.07, 0.06, 0.18, 0.13, 0.16, 0.12),
+  source = "Moderately informative prior"
+)
+
+all_df <- rbind(uninfor_prior, moderate_prior)
+
+ggplot(all_df, aes(x = mean, y = factor(theta, levels = unique(theta)), color = source)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), position = position_dodge(width = 0.5), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_minimal() +
+  scale_color_manual(values = c("Uninformative prior" = "red", "Moderately informative prior" = "blue")) +
+  labs(
+    title = "Prior Senstivity Analysis: Player Level",
+    x = "",
+    y = "",
+    color = "Source"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    text = element_text(size = 20),
+    legend.position = "bottom"
+  )
+```
+
+
+
+
+## 5.2 Group Level
+### 5.2.1 Data Merging
+```{r}
+team_df <- player_df %>%
+  # Radiant=1-5，Dire=6-10
+  mutate(team = ifelse(player_slot < 5, "radiant", "dire")) %>%
+  group_by(match_id, team, duration) %>%
+  summarise(
+    total_kills = sum(kills),
+    total_deaths = sum(deaths),
+    total_assists = sum(assists),
+    total_gold = sum(gold),
+    total_tower_dmg = sum(tower_damage),
+    total_hero_dmg = sum(hero_damage),
+    total_healing = sum(hero_healing),
+    total_teamfight_dmg = sum(teamfight_damage),
+    total_teamfight_xp = sum(teamfight_xp_end),
+    radiant_win = first(radiant_win)
+  ) %>%
+  ungroup() %>%
+  group_by(match_id) %>%
+  mutate(
+    across(
+      c(total_kills, total_gold, total_teamfight_dmg, total_teamfight_xp),
+      ~ .x - lag(.x), 
+      .names = "diff_{.col}"
+    )
+  ) %>%
+  ungroup() %>%
+  filter(team == "radiant") %>% 
+  mutate(win = as.numeric(radiant_win)) %>%
+  select(-team, -radiant_win) %>%
+  drop_na()
+```
+
+### 5.2.2 Model
+```{r}
+team_stan_model <- "
+data {
+  int<lower=0> N;                  // Number of matches
+  array[N] int<lower=0,upper=1> win; // Radiant victory indicator (1 = win, 0 = loss)
+  vector[N] diff_kills;            // Kill differential (Radiant - Dire)
+  vector[N] diff_gold;             // Gold differential
+  vector[N] diff_teamfight_dmg;    // Teamfight damage differential
+  vector[N] diff_teamfight_xp;     // Teamfight experience differential
+  vector[N] duration;              // Match duration (in seconds)
+}
+parameters {
+  real intercept;
+  real theta_kills;
+  real theta_gold;
+  real theta_damage;
+  real theta_xp;
+  real theta_duration;
+}
+model {
+  // Weakly informative priors
+  intercept ~ normal(0, 1);
+  theta_kills ~ normal(0, 0.5);
+  theta_gold ~ normal(0, 0.5);
+  theta_damage ~ normal(0, 0.5);
+  theta_xp ~ normal(0, 0.5);
+  theta_duration ~ normal(0, 0.5);
+  
+  // Logistic regression model
+  win ~ bernoulli_logit(
+    intercept +
+    theta_kills * diff_kills +
+    theta_gold * diff_gold +
+    theta_damage * diff_teamfight_dmg +
+    theta_xp * diff_teamfight_xp +
+    theta_duration * duration
+  );
+}
+"
+```
+```{r}
+# Standardization (except duration)
+team_df <- team_df %>%
+  mutate(
+    across(
+      starts_with("diff_"), 
+      ~ as.vector(scale(.x)), 
+      .names = "{.col}_z"
+    ),
+    duration_z = as.vector(scale(duration))
+  )
+
+stan_data <- list(
+  N = nrow(team_df),
+  win = team_df$win,
+  diff_kills = team_df$diff_total_kills_z,
+  diff_gold = team_df$diff_total_gold_z,
+  diff_teamfight_dmg = team_df$diff_total_teamfight_dmg_z,
+  diff_teamfight_xp = team_df$diff_total_teamfight_xp_z,
+  duration = team_df$duration_z
+)
+
+team_model <- stan_model(model_code = team_stan_model)
+fit4 <- sampling(
+  team_model,
+  data = stan_data,
+  chains = 2,
+  iter = 10000,
+  warmup = 1000,
+  seed = 451
+)
+```
+
+### 5.2.3 Plots & Results
+```{r}
+stan_trace(fit4, nrow = 5)
+stan_hist(fit4)
+stan_scat(fit4, pars = c("intercept", "theta_duration"))
+posterior_theta = as.data.frame(fit4)$theta_kills
+print(fit4, pars = c("intercept", "theta_kills", "theta_gold", "theta_damage", "theta_xp", "theta_duration"), probs = c(0.025, 0.975))
+```
+```{r}
+mcmc_samples_4 <- As.mcmc.list(fit4)
+param_names_4 <- c("intercept", "theta_kills", "theta_gold", 
+                   "theta_damage", "theta_xp", "theta_duration")
+# Autocorrelation
+acfplot(mcmc_samples_4[, param_names_4])
+# ESS
+ess_vals_4 <- effectiveSize(mcmc_samples_4)
+
+ess_df_4 <- data.frame(
+  parameter = param_names_4,
+  ess = ess_vals_4[param_names_4]
+)
+
+# histogram
+ggplot(ess_df_4, aes(x = parameter, y = ess)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Effective Sample Size per Parameter (fit4)",
+    x = "Parameter", y = "Effective Sample Size"
+  ) +
+  geom_text(aes(label = round(ess, 1)), vjust = -0.5)
+
+plot(fit4,
+     pars = c("intercept", 
+              "theta_kills", 
+              "theta_gold", 
+              "theta_damage", 
+              "theta_xp", 
+              "theta_duration"),
+     point_est = "median",      
+     outer_level = 0.95,       
+     show_density = FALSE)    
+
+```
+
+### 5.2.4 Prior Senstivity Analysis
+```{r}
+team_stan_prior_model <- "
+data {
+  int<lower=0> N;                 
+  array[N] int<lower=0,upper=1> win; 
+  vector[N] diff_kills;           
+  vector[N] diff_gold;            
+  vector[N] diff_teamfight_dmg;   
+  vector[N] diff_teamfight_xp;     
+  vector[N] duration;            
+}
+parameters {
+  real intercept;
+  real theta_kills;
+  real theta_gold;
+  real theta_damage;
+  real theta_xp;
+  real theta_duration;
+}
+model {
+  // Wider priors
+  intercept ~ normal(0, 2);
+  theta_kills ~ normal(0, 2);
+  theta_gold ~ normal(0, 2);
+  theta_damage ~ normal(0, 2);
+  theta_xp ~ normal(0, 2);
+  theta_duration ~ normal(0, 2);
+
+  win ~ bernoulli_logit(
+    intercept +
+    theta_kills * diff_kills +
+    theta_gold * diff_gold +
+    theta_damage * diff_teamfight_dmg +
+    theta_xp * diff_teamfight_xp +
+    theta_duration * duration
+  );
+}
+"
+```
+```{r}
+team_model_prior = stan_model(model_code = team_stan_prior_model)
+fit_team_prior = sampling(
+  team_model_prior,
+  data = stan_data,
+  chains = 2,
+  iter = 10000,
+  warmup = 1000,
+  seed = 451
+)
+```
+```{r}
+# Compare posterior estimates
+print(fit_team, pars = c("intercept", "theta_kills", "theta_gold", "theta_damage", "theta_xp", "theta_duration"), probs = c(0.025, 0.975))
+print(fit_team_prior, pars = c("intercept", "theta_kills", "theta_gold", "theta_damage", "theta_xp", "theta_duration"), probs = c(0.025, 0.975))
+
+```
+```{r}
+theta_names2 <- c("θ intercept", "θ kills", "θ gold", "θ damage", "θ xp", "θ duration")
+weak_prior_team <- data.frame(
+  theta = theta_names2,
+  mean = c(0.10, 1.69, 3.16, -0.74, -1.88, -0.11),
+  lower = c(-0.12, 1.24, 2.70, -1.09, -2.37, -0.33),
+  upper = c(0.31, 2.14, 3.65, -0.38, -1.41, 0.11),
+  source = "Weakly informative prior"
+)
+
+# Prior data
+moderate_prior_team <- data.frame(
+  theta = theta_names2,
+  mean = c(0.08, 1.48, 2.94, -1.00, -1.71, -0.20),
+  lower = c(-0.19, 0.72, 2.10, -1.48, -2.55, -0.48),
+  upper = c(0.36, 2.24, 3.78, -0.52, -0.87, 0.07),
+  source = "Moderately informative prior"
+)
+
+all_df_team <- rbind(weak_prior_team, moderate_prior_team)
+
+ggplot(all_df_team, aes(x = mean, y = factor(theta, levels = unique(theta)), color = source)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), position = position_dodge(width = 0.5), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_minimal() +
+  scale_color_manual(values = c("Weakly informative prior" = "red", "Moderately informative prior" = "blue")) +
+  labs(
+    title = "Prior Senstivity Analysis: Group Level",
+    x = "",
+    y = "",
+    color = "Source"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    text = element_text(size = 20),
+    legend.position = "bottom"
+  ) # 683, 400
+```
+
+
+
